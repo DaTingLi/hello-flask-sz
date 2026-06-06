@@ -1,0 +1,95 @@
+name: CD
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  cd:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+            -t hello-flask-sz:latest .
+
+      - name: Deploy to server
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+        run: |
+          # Setup SSH
+          mkdir -p ~/.ssh
+          echo "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts
+
+          # Deploy directory
+          DEPLOY_DIR="/opt/hello-flask-sz"
+          APP="hello-flask-sz"
+          PORT=8003
+          PORT_MAX=8020
+
+          # Create deploy directory
+          ssh -i ~/.ssh/deploy_key "${SSH_USER}@${SSH_HOST}" "mkdir -p ${DEPLOY_DIR}"
+
+          # Sync files
+          rsync -avz -e "ssh -i ~/.ssh/deploy_key" \
+            --exclude='.git/' \
+            --exclude='standards/' \
+            --exclude='__pycache__/' \
+            --exclude='*.pyc' \
+            ./ "${SSH_USER}@${SSH_HOST}:${DEPLOY_DIR}/"
+
+          # Remote deployment script
+          ssh -i ~/.ssh/deploy_key "${SSH_USER}@${SSH_HOST}" << 'ENDSSH'
+          set -e
+          cd /opt/hello-flask-sz
+
+          # Build on server
+          docker build \
+            --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+            -t hello-flask-sz:latest .
+
+          # Port fallback logic
+          port_in_use() {
+            ss -ltnH 2>/dev/null | grep -q ":$1 " && return 0
+            docker ps --format "{{.Ports}}" 2>/dev/null | grep -q ":$1->" && return 0
+            return 1
+          }
+
+          PORT=""
+          for p in $(seq 8003 8020); do
+            if ! port_in_use "$p"; then PORT="$p"; break; fi
+          done
+
+          if [ -z "$PORT" ]; then
+            echo "预留端口区间已全部占用,部署中止"
+            exit 1
+          fi
+
+          echo ">> 部署到主机端口 $PORT"
+
+          # Stop and remove old container (idempotent)
+          docker rm -f hello-flask-sz 2>/dev/null || true
+
+          # Run new container
+          docker run -d \
+            --name hello-flask-sz \
+            --restart unless-stopped \
+            -p ${PORT}:8003 \
+            hello-flask-sz:latest
+
+          # Wait for startup
+          sleep 3
+
+          # Health check
+          curl -fsS "http://localhost:${PORT}/health"
+          echo ">> 部署成功: http://localhost:${PORT}/health"
+          ENDSSH
